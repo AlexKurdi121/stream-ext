@@ -85,7 +85,6 @@ export default function XtreamPage() {
   // Parse M3U URL to extract server URL, username, and password
   const parseM3uUrl = (url: string): { serverUrl: string; username: string; password: string } | null => {
     try {
-      // Pattern 1: http://host:port/get.php?username=XXX&password=XXX&type=m3u_plus
       const urlObj = new URL(url);
       const params = new URLSearchParams(urlObj.search);
       
@@ -97,29 +96,12 @@ export default function XtreamPage() {
         return { serverUrl, username, password };
       }
       
-      // Pattern 2: http://host:port/username/password
       const pathParts = urlObj.pathname.split('/').filter(p => p);
       if (pathParts.length >= 2) {
         const [user, pass] = pathParts.slice(-2);
         const serverUrl = `${urlObj.protocol}//${urlObj.host}`;
-        // Check if user and pass look like valid credentials (not too long, not containing special chars)
         if (user && pass && user.length < 50 && pass.length < 50) {
           return { serverUrl, username: user, password: pass };
-        }
-      }
-      
-      // Pattern 3: Try to extract from URL without get.php
-      // http://host:port/username/password/type
-      const pathParts2 = urlObj.pathname.split('/').filter(p => p);
-      if (pathParts2.length >= 2) {
-        // Check if the last two parts look like username and password
-        const possibleUser = pathParts2[pathParts2.length - 2];
-        const possiblePass = pathParts2[pathParts2.length - 1];
-        if (possibleUser && possiblePass && 
-            possibleUser.length < 50 && possiblePass.length < 50 &&
-            !possibleUser.includes('.') && !possiblePass.includes('.')) {
-          const serverUrl = `${urlObj.protocol}//${urlObj.host}`;
-          return { serverUrl, username: possibleUser, password: possiblePass };
         }
       }
       
@@ -144,7 +126,6 @@ export default function XtreamPage() {
         });
         setError('');
       } else {
-        // Don't clear credentials, just show a hint
         setError('Could not auto-parse. Please enter credentials manually.');
       }
     }
@@ -153,31 +134,32 @@ export default function XtreamPage() {
   // Fetch account info to get expiry date
   const fetchAccountInfo = useCallback(async () => {
     try {
-      const apiUrl = `${credentials.serverUrl}/player_api.php?username=${credentials.username}&password=${credentials.password}&action=get_live_streams`;
-      const response = await axios.get(apiUrl, {
-        timeout: 30000,
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-          'Accept': 'application/json',
-        }
+      // Use the proxy API
+      const response = await axios.post('/api/xtream', {
+        serverUrl: credentials.serverUrl,
+        username: credentials.username,
+        password: credentials.password,
+        action: 'get_live_streams'
       });
 
-      if (response.data && typeof response.data === 'object') {
-        if (response.data.account_info) {
-          setAccountInfo(response.data.account_info);
-          localStorage.setItem('xtreamAccountInfo', JSON.stringify(response.data.account_info));
+      if (response.data.success && response.data.data) {
+        const data = response.data.data;
+        
+        if (data.account_info) {
+          setAccountInfo(data.account_info);
+          localStorage.setItem('xtreamAccountInfo', JSON.stringify(data.account_info));
           
-          const expiry = response.data.account_info.exp_date || 
-                        response.data.account_info.expiry_date || 
-                        response.data.account_info.expires;
+          const expiry = data.account_info.exp_date || 
+                        data.account_info.expiry_date || 
+                        data.account_info.expires;
           if (expiry) {
             setExpiryDate(expiry);
             localStorage.setItem('xtreamExpiry', expiry);
           }
         }
-        if (response.data.user_info) {
-          const expiry = response.data.user_info.exp_date || 
-                        response.data.user_info.expiry_date;
+        if (data.user_info) {
+          const expiry = data.user_info.exp_date || 
+                        data.user_info.expiry_date;
           if (expiry) {
             setExpiryDate(expiry);
             localStorage.setItem('xtreamExpiry', expiry);
@@ -189,58 +171,59 @@ export default function XtreamPage() {
     }
   }, [credentials]);
 
-  // Fetch channels directly from the server
+  // Fetch channels using the proxy API
   const fetchChannels = useCallback(async () => {
     setLoading(true);
     setError('');
     try {
-      const apiUrl = `${credentials.serverUrl}/player_api.php?username=${credentials.username}&password=${credentials.password}&action=get_live_streams`;
-      
-      const response = await axios.get(apiUrl, {
-        timeout: 30000,
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-          'Accept': 'application/json',
-        }
+      // Use the proxy API route instead of direct call
+      const response = await axios.post('/api/xtream', {
+        serverUrl: credentials.serverUrl,
+        username: credentials.username,
+        password: credentials.password,
+        action: 'get_live_streams'
       });
 
-      if (Array.isArray(response.data)) {
-        setChannels(response.data);
-        setFilteredChannels(response.data);
-        setCurrentPage(1);
-        setIsLoggedIn(true);
-        localStorage.setItem('streamCredentials', JSON.stringify(credentials));
-        localStorage.setItem('xtreamChannels', JSON.stringify(response.data));
+      if (response.data.success) {
+        const data = response.data.data;
         
-        await fetchAccountInfo();
-      } else if (response.data && typeof response.data === 'object') {
-        const dataArray = response.data.data || response.data.channels || response.data.list;
-        if (Array.isArray(dataArray)) {
-          setChannels(dataArray);
-          setFilteredChannels(dataArray);
+        // Handle different response formats
+        let channelsData = null;
+        
+        if (Array.isArray(data)) {
+          channelsData = data;
+        } else if (data && typeof data === 'object') {
+          channelsData = data.channels || data.list || data.items || data;
+          if (!Array.isArray(channelsData)) {
+            // Try to find any array in the response
+            for (const key of Object.keys(data)) {
+              if (Array.isArray(data[key])) {
+                channelsData = data[key];
+                break;
+              }
+            }
+          }
+        }
+
+        if (Array.isArray(channelsData) && channelsData.length > 0) {
+          setChannels(channelsData);
+          setFilteredChannels(channelsData);
           setCurrentPage(1);
           setIsLoggedIn(true);
           localStorage.setItem('streamCredentials', JSON.stringify(credentials));
-          localStorage.setItem('xtreamChannels', JSON.stringify(dataArray));
+          localStorage.setItem('xtreamChannels', JSON.stringify(channelsData));
           
+          // Fetch account info for expiry
           await fetchAccountInfo();
         } else {
-          setError('Invalid response format - Expected array of channels');
+          setError('No channels found. Please check your credentials.');
         }
       } else {
-        setError('Invalid response format');
+        setError(response.data.error || 'Failed to fetch channels');
       }
     } catch (err: any) {
       console.error('Fetch error:', err);
-      if (err.code === 'ECONNABORTED') {
-        setError('Connection timeout - The server is taking too long to respond');
-      } else if (err.response) {
-        setError(`Server error: ${err.response.status} - ${err.response.statusText}`);
-      } else if (err.request) {
-        setError('Network error - Could not connect to the server. Please check your URL.');
-      } else {
-        setError(err.message || 'Failed to fetch channels');
-      }
+      setError(err.message || 'Failed to fetch channels. Please check your credentials.');
       setIsLoggedIn(false);
     } finally {
       setLoading(false);
@@ -314,7 +297,6 @@ export default function XtreamPage() {
     }
   };
 
-  // Check if account is expired
   const isExpired = (): boolean => {
     if (!expiryDate) return false;
     const expiry = new Date(expiryDate);
@@ -322,7 +304,6 @@ export default function XtreamPage() {
     return expiry < now;
   };
 
-  // Get days until expiry
   const getDaysUntilExpiry = (): number | null => {
     if (!expiryDate) return null;
     const expiry = new Date(expiryDate);
@@ -332,7 +313,6 @@ export default function XtreamPage() {
     return diffDays;
   };
 
-  // Format expiry date
   const formatExpiryDate = (): string => {
     if (!expiryDate) return 'Not available';
     try {
@@ -369,7 +349,7 @@ export default function XtreamPage() {
                 value={m3uUrlInput}
                 onChange={handleM3uUrlInput}
                 className="w-full px-4 py-3 bg-gray-700 border border-gray-600 rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-500 text-white transition-all"
-                placeholder="http://xlion.net:8080/get.php?username=b0:99:d7:15:88:50&password=3090914536649669&type=m3u_plus"
+                placeholder="http://xlion.net:8080/get.php?username=XXX&password=XXX&type=m3u_plus"
               />
               <div className="flex items-center gap-2 mt-1">
                 <p className="text-xs text-gray-400">Auto-extracts: Host, Username, Password</p>
@@ -510,7 +490,6 @@ export default function XtreamPage() {
                       <div className="text-white text-sm font-bold">{channels.length.toLocaleString()}</div>
                     </div>
                     
-                    {/* Expiry Section */}
                     <div className={`rounded-xl p-4 border ${
                       isExpired() 
                         ? 'bg-red-900/30 border-red-700' 
