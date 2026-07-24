@@ -23,11 +23,14 @@ export default function XtreamPage() {
   const [totalPages, setTotalPages] = useState(1);
   const [isSearching, setIsSearching] = useState(false);
   const [showProfile, setShowProfile] = useState(false);
+  const [expiryDate, setExpiryDate] = useState<string | null>(null);
+  const [accountInfo, setAccountInfo] = useState<any>(null);
+  const [m3uUrlInput, setM3uUrlInput] = useState('');
   
   const [credentials, setCredentials] = useState<StreamCredentials>({
-    serverUrl: '',
-    username: '',
-    password: ''
+    serverUrl: 'http://1@android.dragonsdog.com:80',
+    username: '01E8M34c60',
+    password: 'alessiojaco'
   });
 
   useEffect(() => {
@@ -41,6 +44,14 @@ export default function XtreamPage() {
       setChannels(data);
       setFilteredChannels(data);
       setIsLoggedIn(true);
+    }
+    const savedExpiry = localStorage.getItem('xtreamExpiry');
+    if (savedExpiry) {
+      setExpiryDate(savedExpiry);
+    }
+    const savedAccountInfo = localStorage.getItem('xtreamAccountInfo');
+    if (savedAccountInfo) {
+      setAccountInfo(JSON.parse(savedAccountInfo));
     }
   }, []);
 
@@ -71,13 +82,128 @@ export default function XtreamPage() {
     return () => clearTimeout(debounceTimeout);
   }, [searchTerm, channels]);
 
+  // Parse M3U URL to extract server URL, username, and password
+  const parseM3uUrl = (url: string): { serverUrl: string; username: string; password: string } | null => {
+    try {
+      // Pattern 1: http://host:port/get.php?username=XXX&password=XXX&type=m3u_plus
+      const urlObj = new URL(url);
+      const params = new URLSearchParams(urlObj.search);
+      
+      let username = params.get('username');
+      let password = params.get('password');
+      
+      if (username && password) {
+        const serverUrl = `${urlObj.protocol}//${urlObj.host}`;
+        return { serverUrl, username, password };
+      }
+      
+      // Pattern 2: http://host:port/username/password
+      const pathParts = urlObj.pathname.split('/').filter(p => p);
+      if (pathParts.length >= 2) {
+        const [user, pass] = pathParts.slice(-2);
+        const serverUrl = `${urlObj.protocol}//${urlObj.host}`;
+        // Check if user and pass look like valid credentials (not too long, not containing special chars)
+        if (user && pass && user.length < 50 && pass.length < 50) {
+          return { serverUrl, username: user, password: pass };
+        }
+      }
+      
+      // Pattern 3: Try to extract from URL without get.php
+      // http://host:port/username/password/type
+      const pathParts2 = urlObj.pathname.split('/').filter(p => p);
+      if (pathParts2.length >= 2) {
+        // Check if the last two parts look like username and password
+        const possibleUser = pathParts2[pathParts2.length - 2];
+        const possiblePass = pathParts2[pathParts2.length - 1];
+        if (possibleUser && possiblePass && 
+            possibleUser.length < 50 && possiblePass.length < 50 &&
+            !possibleUser.includes('.') && !possiblePass.includes('.')) {
+          const serverUrl = `${urlObj.protocol}//${urlObj.host}`;
+          return { serverUrl, username: possibleUser, password: possiblePass };
+        }
+      }
+      
+      return null;
+    } catch {
+      return null;
+    }
+  };
+
+  // Handle M3U URL input for auto-parse
+  const handleM3uUrlInput = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const url = e.target.value;
+    setM3uUrlInput(url);
+    
+    if (url) {
+      const parsed = parseM3uUrl(url);
+      if (parsed) {
+        setCredentials({
+          serverUrl: parsed.serverUrl,
+          username: parsed.username,
+          password: parsed.password
+        });
+        setError('');
+      } else {
+        // Don't clear credentials, just show a hint
+        setError('Could not auto-parse. Please enter credentials manually.');
+      }
+    }
+  };
+
+  // Fetch account info to get expiry date
+  const fetchAccountInfo = useCallback(async () => {
+    try {
+      const apiUrl = `${credentials.serverUrl}/player_api.php?username=${credentials.username}&password=${credentials.password}&action=get_live_streams`;
+      const response = await axios.get(apiUrl, {
+        timeout: 30000,
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+          'Accept': 'application/json',
+        }
+      });
+
+      if (response.data && typeof response.data === 'object') {
+        if (response.data.account_info) {
+          setAccountInfo(response.data.account_info);
+          localStorage.setItem('xtreamAccountInfo', JSON.stringify(response.data.account_info));
+          
+          const expiry = response.data.account_info.exp_date || 
+                        response.data.account_info.expiry_date || 
+                        response.data.account_info.expires;
+          if (expiry) {
+            setExpiryDate(expiry);
+            localStorage.setItem('xtreamExpiry', expiry);
+          }
+        }
+        if (response.data.user_info) {
+          const expiry = response.data.user_info.exp_date || 
+                        response.data.user_info.expiry_date;
+          if (expiry) {
+            setExpiryDate(expiry);
+            localStorage.setItem('xtreamExpiry', expiry);
+          }
+        }
+      }
+    } catch (err) {
+      console.log('Could not fetch account info:', err);
+    }
+  }, [credentials]);
+
+  // Fetch channels directly from the server
   const fetchChannels = useCallback(async () => {
     setLoading(true);
     setError('');
     try {
       const apiUrl = `${credentials.serverUrl}/player_api.php?username=${credentials.username}&password=${credentials.password}&action=get_live_streams`;
-      const response = await axios.get(apiUrl);
       
+      const response = await axios.get(apiUrl, {
+        timeout: 30000,
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+          'Accept': 'application/json',
+        }
+      });
+
       if (Array.isArray(response.data)) {
         setChannels(response.data);
         setFilteredChannels(response.data);
@@ -85,16 +211,41 @@ export default function XtreamPage() {
         setIsLoggedIn(true);
         localStorage.setItem('streamCredentials', JSON.stringify(credentials));
         localStorage.setItem('xtreamChannels', JSON.stringify(response.data));
+        
+        await fetchAccountInfo();
+      } else if (response.data && typeof response.data === 'object') {
+        const dataArray = response.data.data || response.data.channels || response.data.list;
+        if (Array.isArray(dataArray)) {
+          setChannels(dataArray);
+          setFilteredChannels(dataArray);
+          setCurrentPage(1);
+          setIsLoggedIn(true);
+          localStorage.setItem('streamCredentials', JSON.stringify(credentials));
+          localStorage.setItem('xtreamChannels', JSON.stringify(dataArray));
+          
+          await fetchAccountInfo();
+        } else {
+          setError('Invalid response format - Expected array of channels');
+        }
       } else {
         setError('Invalid response format');
       }
     } catch (err: any) {
-      setError(err.message || 'Failed to fetch channels');
+      console.error('Fetch error:', err);
+      if (err.code === 'ECONNABORTED') {
+        setError('Connection timeout - The server is taking too long to respond');
+      } else if (err.response) {
+        setError(`Server error: ${err.response.status} - ${err.response.statusText}`);
+      } else if (err.request) {
+        setError('Network error - Could not connect to the server. Please check your URL.');
+      } else {
+        setError(err.message || 'Failed to fetch channels');
+      }
       setIsLoggedIn(false);
     } finally {
       setLoading(false);
     }
-  }, [credentials]);
+  }, [credentials, fetchAccountInfo]);
 
   const handleLogin = (e: React.FormEvent) => {
     e.preventDefault();
@@ -119,8 +270,13 @@ export default function XtreamPage() {
     setCurrentPage(1);
     setSearchTerm('');
     setShowProfile(false);
+    setExpiryDate(null);
+    setAccountInfo(null);
+    setM3uUrlInput('');
     localStorage.removeItem('streamCredentials');
     localStorage.removeItem('xtreamChannels');
+    localStorage.removeItem('xtreamExpiry');
+    localStorage.removeItem('xtreamAccountInfo');
   };
 
   const showChannelDetails = (channel: Channel) => {
@@ -158,6 +314,41 @@ export default function XtreamPage() {
     }
   };
 
+  // Check if account is expired
+  const isExpired = (): boolean => {
+    if (!expiryDate) return false;
+    const expiry = new Date(expiryDate);
+    const now = new Date();
+    return expiry < now;
+  };
+
+  // Get days until expiry
+  const getDaysUntilExpiry = (): number | null => {
+    if (!expiryDate) return null;
+    const expiry = new Date(expiryDate);
+    const now = new Date();
+    const diffTime = expiry.getTime() - now.getTime();
+    const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
+    return diffDays;
+  };
+
+  // Format expiry date
+  const formatExpiryDate = (): string => {
+    if (!expiryDate) return 'Not available';
+    try {
+      const date = new Date(expiryDate);
+      return date.toLocaleDateString('en-US', {
+        year: 'numeric',
+        month: 'long',
+        day: 'numeric',
+        hour: '2-digit',
+        minute: '2-digit'
+      });
+    } catch {
+      return expiryDate;
+    }
+  };
+
   return (
     <Layout>
       {!isLoggedIn ? (
@@ -168,6 +359,30 @@ export default function XtreamPage() {
             <p className="text-gray-400 text-sm mt-2">Enter your Xtream credentials to access channels</p>
           </div>
           <form onSubmit={handleLogin} className="space-y-4">
+            {/* M3U URL Input with Auto-Parse */}
+            <div>
+              <label className="block text-sm font-medium mb-2 text-gray-300">
+                Or paste M3U URL (auto-parse)
+              </label>
+              <input
+                type="text"
+                value={m3uUrlInput}
+                onChange={handleM3uUrlInput}
+                className="w-full px-4 py-3 bg-gray-700 border border-gray-600 rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-500 text-white transition-all"
+                placeholder="http://xlion.net:8080/get.php?username=b0:99:d7:15:88:50&password=3090914536649669&type=m3u_plus"
+              />
+              <div className="flex items-center gap-2 mt-1">
+                <p className="text-xs text-gray-400">Auto-extracts: Host, Username, Password</p>
+                {m3uUrlInput && (
+                  <span className="text-xs text-green-400">✓ Parsed</span>
+                )}
+              </div>
+            </div>
+
+            <div className="border-t border-gray-700 pt-4">
+              <p className="text-xs text-gray-400 text-center mb-4">Or enter manually</p>
+            </div>
+
             <div>
               <label className="block text-sm font-medium mb-2 text-gray-300">Server URL</label>
               <input
@@ -176,9 +391,14 @@ export default function XtreamPage() {
                 value={credentials.serverUrl}
                 onChange={handleInputChange}
                 className="w-full px-4 py-3 bg-gray-700 border border-gray-600 rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-500 text-white transition-all"
-                placeholder=""
+                placeholder="http://1@android.dragonsdog.com:80"
                 required
               />
+              {credentials.serverUrl && (
+                <div className="mt-1 text-xs text-gray-400">
+                  🌎 Host: {credentials.serverUrl}
+                </div>
+              )}
             </div>
             <div>
               <label className="block text-sm font-medium mb-2 text-gray-300">Username</label>
@@ -191,6 +411,11 @@ export default function XtreamPage() {
                 placeholder="Enter username"
                 required
               />
+              {credentials.username && (
+                <div className="mt-1 text-xs text-gray-400">
+                  👤 User: {credentials.username}
+                </div>
+              )}
             </div>
             <div>
               <label className="block text-sm font-medium mb-2 text-gray-300">Password</label>
@@ -203,6 +428,11 @@ export default function XtreamPage() {
                 placeholder="Enter password"
                 required
               />
+              {credentials.password && (
+                <div className="mt-1 text-xs text-gray-400">
+                  🔐 Pass: {credentials.password.substring(0, 8)}...
+                </div>
+              )}
             </div>
             {error && (
               <div className="bg-red-900/50 border border-red-700 text-red-200 px-4 py-3 rounded-xl">
@@ -236,6 +466,13 @@ export default function XtreamPage() {
               className="px-5 py-2.5 bg-gradient-to-r from-blue-600 to-blue-700 hover:from-blue-700 hover:to-blue-800 rounded-xl transition-all duration-200 text-sm flex items-center gap-2 shadow-lg hover:shadow-xl"
             >
               <span>👤</span> Profile Info
+              {expiryDate && (
+                <span className={`ml-2 px-2 py-0.5 rounded-full text-xs ${
+                  isExpired() ? 'bg-red-600' : 'bg-green-600'
+                }`}>
+                  {isExpired() ? 'Expired' : `${getDaysUntilExpiry()}d`}
+                </span>
+              )}
             </button>
           </div>
 
@@ -257,22 +494,72 @@ export default function XtreamPage() {
                   </div>
                   <div className="space-y-3">
                     <div className="bg-gray-700/50 rounded-xl p-4">
-                      <div className="text-xs text-gray-400 uppercase tracking-wider mb-1">Server URL</div>
+                      <div className="text-xs text-gray-400 uppercase tracking-wider mb-1">🌎 Host</div>
                       <div className="text-white text-sm break-all font-mono">{credentials.serverUrl}</div>
                     </div>
                     <div className="bg-gray-700/50 rounded-xl p-4">
-                      <div className="text-xs text-gray-400 uppercase tracking-wider mb-1">Username</div>
+                      <div className="text-xs text-gray-400 uppercase tracking-wider mb-1">👤 Username</div>
                       <div className="text-white text-sm font-mono">{credentials.username}</div>
                     </div>
                     <div className="bg-gray-700/50 rounded-xl p-4">
-                      <div className="text-xs text-gray-400 uppercase tracking-wider mb-1">Total Channels</div>
+                      <div className="text-xs text-gray-400 uppercase tracking-wider mb-1">🔐 Password</div>
+                      <div className="text-white text-sm font-mono">••••••••</div>
+                    </div>
+                    <div className="bg-gray-700/50 rounded-xl p-4">
+                      <div className="text-xs text-gray-400 uppercase tracking-wider mb-1">📺 Total Channels</div>
                       <div className="text-white text-sm font-bold">{channels.length.toLocaleString()}</div>
                     </div>
-                    <div className="bg-green-900/30 border border-green-700 rounded-xl p-4">
+                    
+                    {/* Expiry Section */}
+                    <div className={`rounded-xl p-4 border ${
+                      isExpired() 
+                        ? 'bg-red-900/30 border-red-700' 
+                        : expiryDate 
+                          ? 'bg-green-900/30 border-green-700' 
+                          : 'bg-gray-700/50 border-gray-600'
+                    }`}>
+                      <div className="text-xs text-gray-400 uppercase tracking-wider mb-1">📅 Account Status</div>
+                      <div className="flex items-center justify-between">
+                        <span className="text-sm font-semibold">
+                          {expiryDate ? (
+                            isExpired() ? (
+                              <span className="text-red-400">⚠️ EXPIRED</span>
+                            ) : (
+                              <span className="text-green-400">✅ Active</span>
+                            )
+                          ) : (
+                            <span className="text-gray-400">Unknown</span>
+                          )}
+                        </span>
+                        {expiryDate && !isExpired() && (
+                          <span className="text-sm text-green-400">
+                            {getDaysUntilExpiry()} days remaining
+                          </span>
+                        )}
+                      </div>
+                      {expiryDate && (
+                        <div className="mt-2 text-sm">
+                          <span className="text-gray-400">Expires: </span>
+                          <span className={`font-mono ${isExpired() ? 'text-red-400' : 'text-white'}`}>
+                            {formatExpiryDate()}
+                          </span>
+                        </div>
+                      )}
+                    </div>
+
+                    <div className={`rounded-xl p-4 border ${
+                      isExpired() 
+                        ? 'bg-red-900/30 border-red-700' 
+                        : 'bg-green-900/30 border-green-700'
+                    }`}>
                       <div className="text-xs text-gray-400 uppercase tracking-wider mb-1">Status</div>
-                      <div className="text-green-400 text-sm font-semibold flex items-center gap-2">
-                        <span className="inline-block w-2 h-2 bg-green-400 rounded-full animate-pulse"></span>
-                        Connected
+                      <div className={`text-sm font-semibold flex items-center gap-2 ${
+                        isExpired() ? 'text-red-400' : 'text-green-400'
+                      }`}>
+                        <span className={`inline-block w-2 h-2 rounded-full ${
+                          isExpired() ? 'bg-red-400' : 'bg-green-400'
+                        } animate-pulse`}></span>
+                        {isExpired() ? 'Expired - Please renew your subscription' : 'Connected'}
                       </div>
                     </div>
                   </div>
