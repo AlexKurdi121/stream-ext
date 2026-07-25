@@ -1,6 +1,5 @@
 // app/api/xtream/route.ts
 import { NextRequest, NextResponse } from 'next/server';
-import axios from 'axios';
 
 export async function POST(request: NextRequest) {
   try {
@@ -17,17 +16,17 @@ export async function POST(request: NextRequest) {
     // Clean the server URL
     let baseUrl = serverUrl.replace(/\/+$/, '');
     
-    // Remove any protocol prefix from the URL if present in the path
-    // Handle URLs like http://1@android.dragonsdog.com:80
+    // If the URL contains @, extract the actual domain
     if (baseUrl.includes('@')) {
-      // Extract just the domain part
-      const match = baseUrl.match(/https?:\/\/(?:[^@]+@)?([^\/]+)/);
+      const match = baseUrl.match(/^(https?:\/\/)(?:[^@]+@)?(.+)$/);
       if (match) {
-        const protocol = baseUrl.startsWith('https') ? 'https' : 'http';
-        baseUrl = `${protocol}://${match[1]}`;
+        const protocol = match[1];
+        const domain = match[2];
+        baseUrl = `${protocol}${domain}`;
       }
     }
 
+    // Build the API URL
     let apiUrl = '';
     if (action === 'get_live_streams') {
       apiUrl = `${baseUrl}/player_api.php?username=${username}&password=${password}&action=get_live_streams`;
@@ -42,112 +41,132 @@ export async function POST(request: NextRequest) {
     console.log('Fetching from:', apiUrl);
 
     try {
-      const response = await axios.get(apiUrl, {
-        timeout: 30000,
+      // Use fetch API instead of axios (built-in, no dependency issues)
+      const response = await fetch(apiUrl, {
+        method: 'GET',
         headers: {
           'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
           'Accept': 'application/json, text/plain, */*',
           'Accept-Encoding': 'gzip, deflate, br',
           'Connection': 'keep-alive',
         },
-        validateStatus: (status) => status < 500,
+        signal: AbortSignal.timeout(30000),
       });
 
-      // Check if response is JSON
-      if (typeof response.data === 'string' && response.data.startsWith('{')) {
-        try {
-          const jsonData = JSON.parse(response.data);
-          if (jsonData && typeof jsonData === 'object') {
-            if (jsonData.error || jsonData.message) {
-              return NextResponse.json({
-                success: false,
-                error: jsonData.error || jsonData.message || 'Invalid credentials',
-                data: jsonData
-              }, { status: 401 });
-            }
-            return NextResponse.json({
-              success: true,
-              data: jsonData
-            });
-          }
-        } catch (parseError) {
-          // Not JSON, treat as error
+      if (!response.ok) {
+        console.error('Response status:', response.status);
+        const text = await response.text();
+        console.error('Response text:', text.substring(0, 200));
+        
+        return NextResponse.json({
+          success: false,
+          error: `Server responded with status ${response.status}: ${response.statusText}`,
+          details: text.substring(0, 500)
+        }, { status: response.status });
+      }
+
+      // Get the response as text first
+      const text = await response.text();
+      
+      // Try to parse as JSON
+      try {
+        const jsonData = JSON.parse(text);
+        
+        // Check if it's an error response
+        if (jsonData.error || jsonData.message) {
           return NextResponse.json({
             success: false,
-            error: 'Invalid response format from server',
-            raw: response.data.substring(0, 500)
-          }, { status: 500 });
+            error: jsonData.error || jsonData.message || 'Invalid credentials',
+            data: jsonData
+          }, { status: 401 });
         }
-      }
-
-      // If response is an array (channels list)
-      if (Array.isArray(response.data)) {
-        return NextResponse.json({
-          success: true,
-          data: response.data
-        });
-      }
-
-      // If response is an object but not JSON
-      if (typeof response.data === 'object' && response.data !== null) {
-        return NextResponse.json({
-          success: true,
-          data: response.data
-        });
-      }
-
-      // Try to parse as JSON if it's a string
-      if (typeof response.data === 'string') {
-        try {
-          const parsed = JSON.parse(response.data);
+        
+        // If it's an array (channels list)
+        if (Array.isArray(jsonData)) {
           return NextResponse.json({
             success: true,
-            data: parsed
+            data: jsonData
           });
-        } catch (e) {
-          // Not JSON, return as text
+        }
+        
+        // If it's an object
+        if (jsonData && typeof jsonData === 'object') {
+          // Check if it contains an array of channels
+          const channelsArray = jsonData.channels || jsonData.list || jsonData.items || jsonData.data;
+          if (Array.isArray(channelsArray)) {
+            return NextResponse.json({
+              success: true,
+              data: channelsArray
+            });
+          }
+          
+          // Check if any key contains an array
+          for (const key of Object.keys(jsonData)) {
+            if (Array.isArray(jsonData[key]) && jsonData[key].length > 0) {
+              return NextResponse.json({
+                success: true,
+                data: jsonData[key]
+              });
+            }
+          }
+          
+          // Return the whole object
+          return NextResponse.json({
+            success: true,
+            data: jsonData
+          });
+        }
+        
+        return NextResponse.json({
+          success: false,
+          error: 'Unexpected response format',
+          raw: text.substring(0, 500)
+        }, { status: 500 });
+        
+      } catch (parseError) {
+        // Not JSON - check if it's HTML
+        if (text.includes('<!DOCTYPE') || text.includes('<html')) {
           return NextResponse.json({
             success: false,
-            error: 'Invalid response format',
-            raw: response.data.substring(0, 500)
+            error: 'Server returned HTML instead of JSON. Please check the URL.',
+            raw: text.substring(0, 200)
           }, { status: 500 });
         }
+        
+        return NextResponse.json({
+          success: false,
+          error: 'Invalid response format from server',
+          raw: text.substring(0, 500)
+        }, { status: 500 });
       }
 
-      return NextResponse.json({
-        success: false,
-        error: 'Unexpected response format',
-        data: response.data
-      }, { status: 500 });
-
-    } catch (axiosError: any) {
-      console.error('Axios error:', axiosError.message);
+    } catch (fetchError: any) {
+      console.error('Fetch error:', fetchError.message);
       
-      if (axiosError.code === 'ECONNABORTED') {
+      if (fetchError.name === 'AbortError' || fetchError.name === 'TimeoutError') {
         return NextResponse.json({
           success: false,
           error: 'Connection timeout - The server is taking too long to respond'
         }, { status: 408 });
       }
       
-      if (axiosError.code === 'ENOTFOUND') {
+      if (fetchError.message.includes('ENOTFOUND') || fetchError.message.includes('getaddrinfo')) {
         return NextResponse.json({
           success: false,
           error: 'Server not found - Please check the server URL'
         }, { status: 404 });
       }
 
-      if (axiosError.response) {
+      if (fetchError.message.includes('ECONNREFUSED')) {
         return NextResponse.json({
           success: false,
-          error: `Server responded with status ${axiosError.response.status}: ${axiosError.response.statusText}`,
-          details: axiosError.response.data
-        }, { status: axiosError.response.status });
+          error: 'Connection refused - The server is not accepting connections'
+        }, { status: 503 });
       }
 
       return NextResponse.json({
         success: false,
-        error: axiosError.message || 'Failed to connect to server'
+        error: fetchError.message || 'Failed to connect to server'
       }, { status: 500 });
     }
 

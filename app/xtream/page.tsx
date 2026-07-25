@@ -28,15 +28,69 @@ export default function XtreamPage() {
   const [m3uUrlInput, setM3uUrlInput] = useState('');
   
   const [credentials, setCredentials] = useState<StreamCredentials>({
-    serverUrl: 'http://1@android.dragonsdog.com:80',
+    serverUrl: 'http://android.dragonsdog.com:80',
     username: '01E8M34c60',
     password: 'alessiojaco'
   });
 
+  // Extract base URL from server URL (remove any @ prefix)
+  const getBaseUrl = (url: string): string => {
+    if (!url) return '';
+    let baseUrl = url.replace(/\/+$/, '');
+    
+    // Handle URLs with @ (like http://1@android.dragonsdog.com:80)
+    if (baseUrl.includes('@')) {
+      const match = baseUrl.match(/^(https?:\/\/)(?:[^@]+@)?(.+)$/);
+      if (match) {
+        return `${match[1]}${match[2]}`;
+      }
+    }
+    
+    // Handle URLs without protocol
+    if (!baseUrl.startsWith('http://') && !baseUrl.startsWith('https://')) {
+      baseUrl = `http://${baseUrl}`;
+    }
+    
+    return baseUrl;
+  };
+
+  // Parse M3U URL to extract server URL, username, and password
+  const parseM3uUrl = (url: string): { serverUrl: string; username: string; password: string } | null => {
+    try {
+      const urlObj = new URL(url);
+      const params = new URLSearchParams(urlObj.search);
+      
+      let username = params.get('username');
+      let password = params.get('password');
+      
+      if (username && password) {
+        const serverUrl = `${urlObj.protocol}//${urlObj.host}`;
+        return { serverUrl, username, password };
+      }
+      
+      const pathParts = urlObj.pathname.split('/').filter(p => p);
+      if (pathParts.length >= 2) {
+        const [user, pass] = pathParts.slice(-2);
+        const serverUrl = `${urlObj.protocol}//${urlObj.host}`;
+        if (user && pass && user.length < 50 && pass.length < 50) {
+          return { serverUrl, username: user, password: pass };
+        }
+      }
+      
+      return null;
+    } catch {
+      return null;
+    }
+  };
+
   useEffect(() => {
     const savedCredentials = localStorage.getItem('streamCredentials');
     if (savedCredentials) {
-      setCredentials(JSON.parse(savedCredentials));
+      const parsed = JSON.parse(savedCredentials);
+      if (parsed.serverUrl) {
+        parsed.serverUrl = getBaseUrl(parsed.serverUrl);
+      }
+      setCredentials(parsed);
     }
     const savedChannels = localStorage.getItem('xtreamChannels');
     if (savedChannels) {
@@ -82,35 +136,6 @@ export default function XtreamPage() {
     return () => clearTimeout(debounceTimeout);
   }, [searchTerm, channels]);
 
-  // Parse M3U URL to extract server URL, username, and password
-  const parseM3uUrl = (url: string): { serverUrl: string; username: string; password: string } | null => {
-    try {
-      const urlObj = new URL(url);
-      const params = new URLSearchParams(urlObj.search);
-      
-      let username = params.get('username');
-      let password = params.get('password');
-      
-      if (username && password) {
-        const serverUrl = `${urlObj.protocol}//${urlObj.host}`;
-        return { serverUrl, username, password };
-      }
-      
-      const pathParts = urlObj.pathname.split('/').filter(p => p);
-      if (pathParts.length >= 2) {
-        const [user, pass] = pathParts.slice(-2);
-        const serverUrl = `${urlObj.protocol}//${urlObj.host}`;
-        if (user && pass && user.length < 50 && pass.length < 50) {
-          return { serverUrl, username: user, password: pass };
-        }
-      }
-      
-      return null;
-    } catch {
-      return null;
-    }
-  };
-
   // Handle M3U URL input for auto-parse
   const handleM3uUrlInput = (e: React.ChangeEvent<HTMLInputElement>) => {
     const url = e.target.value;
@@ -134,13 +159,29 @@ export default function XtreamPage() {
   // Fetch account info to get expiry date
   const fetchAccountInfo = useCallback(async () => {
     try {
-      // Use the proxy API
-      const response = await axios.post('/api/xtream', {
-        serverUrl: credentials.serverUrl,
-        username: credentials.username,
-        password: credentials.password,
-        action: 'get_live_streams'
-      });
+      const cleanServerUrl = getBaseUrl(credentials.serverUrl);
+      
+      let response;
+      try {
+        response = await axios.post('/api/xtream', {
+          serverUrl: cleanServerUrl,
+          username: credentials.username,
+          password: credentials.password,
+          action: 'get_live_streams'
+        }, {
+          timeout: 30000
+        });
+      } catch (firstError) {
+        console.log('Main API failed, trying CORS endpoint...');
+        response = await axios.post('/api/xtream/cors', {
+          serverUrl: cleanServerUrl,
+          username: credentials.username,
+          password: credentials.password,
+          action: 'get_live_streams'
+        }, {
+          timeout: 30000
+        });
+      }
 
       if (response.data.success && response.data.data) {
         const data = response.data.data;
@@ -176,28 +217,42 @@ export default function XtreamPage() {
     setLoading(true);
     setError('');
     try {
-      // Use the proxy API route instead of direct call
-      const response = await axios.post('/api/xtream', {
-        serverUrl: credentials.serverUrl,
-        username: credentials.username,
-        password: credentials.password,
-        action: 'get_live_streams'
-      });
+      const cleanServerUrl = getBaseUrl(credentials.serverUrl);
+      
+      let response;
+      try {
+        response = await axios.post('/api/xtream', {
+          serverUrl: cleanServerUrl,
+          username: credentials.username,
+          password: credentials.password,
+          action: 'get_live_streams'
+        }, {
+          timeout: 30000
+        });
+      } catch (firstError: any) {
+        console.log('Main API failed, trying CORS endpoint...');
+        response = await axios.post('/api/xtream/cors', {
+          serverUrl: cleanServerUrl,
+          username: credentials.username,
+          password: credentials.password,
+          action: 'get_live_streams'
+        }, {
+          timeout: 30000
+        });
+      }
 
       if (response.data.success) {
         const data = response.data.data;
         
-        // Handle different response formats
         let channelsData = null;
         
         if (Array.isArray(data)) {
           channelsData = data;
         } else if (data && typeof data === 'object') {
-          channelsData = data.channels || data.list || data.items || data;
+          channelsData = data.channels || data.list || data.items || data.data || data;
           if (!Array.isArray(channelsData)) {
-            // Try to find any array in the response
             for (const key of Object.keys(data)) {
-              if (Array.isArray(data[key])) {
+              if (Array.isArray(data[key]) && data[key].length > 0) {
                 channelsData = data[key];
                 break;
               }
@@ -210,10 +265,14 @@ export default function XtreamPage() {
           setFilteredChannels(channelsData);
           setCurrentPage(1);
           setIsLoggedIn(true);
-          localStorage.setItem('streamCredentials', JSON.stringify(credentials));
+          
+          const savedCredentials = {
+            ...credentials,
+            serverUrl: cleanServerUrl
+          };
+          localStorage.setItem('streamCredentials', JSON.stringify(savedCredentials));
           localStorage.setItem('xtreamChannels', JSON.stringify(channelsData));
           
-          // Fetch account info for expiry
           await fetchAccountInfo();
         } else {
           setError('No channels found. Please check your credentials.');
@@ -223,7 +282,18 @@ export default function XtreamPage() {
       }
     } catch (err: any) {
       console.error('Fetch error:', err);
-      setError(err.message || 'Failed to fetch channels. Please check your credentials.');
+      
+      if (err.code === 'ECONNABORTED' || err.message?.includes('timeout')) {
+        setError('Connection timeout. The server is taking too long to respond.');
+      } else if (err.response?.status === 404) {
+        setError('Server not found. Please check your URL.');
+      } else if (err.response?.status === 401 || err.response?.status === 403) {
+        setError('Authentication failed. Please check your username and password.');
+      } else if (err.message?.includes('Network Error')) {
+        setError('Network error. Please check your internet connection and try again.');
+      } else {
+        setError(err.message || 'Failed to fetch channels. Please check your credentials.');
+      }
       setIsLoggedIn(false);
     } finally {
       setLoading(false);
@@ -279,7 +349,7 @@ export default function XtreamPage() {
 
   const generateM3u8Url = (id: string | number): string => {
     const streamId = typeof id === 'string' ? parseInt(id) : id;
-    const baseUrl = credentials.serverUrl.replace(/\/+$/, '');
+    const baseUrl = getBaseUrl(credentials.serverUrl);
     return `${baseUrl}/live/${credentials.username}/${credentials.password}/${streamId}.m3u8`;
   };
 
@@ -371,7 +441,7 @@ export default function XtreamPage() {
                 value={credentials.serverUrl}
                 onChange={handleInputChange}
                 className="w-full px-4 py-3 bg-gray-700 border border-gray-600 rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-500 text-white transition-all"
-                placeholder="http://1@android.dragonsdog.com:80"
+                placeholder="http://android.dragonsdog.com:80"
                 required
               />
               {credentials.serverUrl && (
