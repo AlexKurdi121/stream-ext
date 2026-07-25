@@ -10,6 +10,67 @@ import { StalkerChannel, StalkerData, StalkerCredentials } from '../types';
 
 const CHANNELS_PER_PAGE = 100;
 
+// IndexedDB helper functions
+const DB_NAME = 'IPTVApp';
+const STORE_NAME = 'stalkerData';
+const DB_VERSION = 1;
+
+const openDB = (): Promise<IDBDatabase> => {
+  return new Promise((resolve, reject) => {
+    const request = indexedDB.open(DB_NAME, DB_VERSION);
+    
+    request.onerror = () => reject(request.error);
+    request.onsuccess = () => resolve(request.result);
+    
+    request.onupgradeneeded = (event) => {
+      const db = (event.target as IDBOpenDBRequest).result;
+      if (!db.objectStoreNames.contains(STORE_NAME)) {
+        db.createObjectStore(STORE_NAME, { keyPath: 'id' });
+      }
+    };
+  });
+};
+
+const saveToIndexedDB = async (key: string, data: any): Promise<void> => {
+  try {
+    const db = await openDB();
+    const transaction = db.transaction(STORE_NAME, 'readwrite');
+    const store = transaction.objectStore(STORE_NAME);
+    store.put({ id: key, data: data });
+    
+    return new Promise((resolve, reject) => {
+      transaction.oncomplete = () => resolve();
+      transaction.onerror = () => reject(transaction.error);
+    });
+  } catch (error) {
+    console.error('Error saving to IndexedDB:', error);
+    throw error;
+  }
+};
+
+const loadFromIndexedDB = async (key: string): Promise<any> => {
+  try {
+    const db = await openDB();
+    const transaction = db.transaction(STORE_NAME, 'readonly');
+    const store = transaction.objectStore(STORE_NAME);
+    const request = store.get(key);
+    
+    return new Promise((resolve, reject) => {
+      request.onsuccess = () => {
+        if (request.result) {
+          resolve(request.result.data);
+        } else {
+          resolve(null);
+        }
+      };
+      request.onerror = () => reject(request.error);
+    });
+  } catch (error) {
+    console.error('Error loading from IndexedDB:', error);
+    return null;
+  }
+};
+
 export default function MacStalkerPage() {
   const [channels, setChannels] = useState<StalkerChannel[]>([]);
   const [filteredChannels, setFilteredChannels] = useState<StalkerChannel[]>([]);
@@ -24,25 +85,96 @@ export default function MacStalkerPage() {
   const [isSearching, setIsSearching] = useState(false);
   const [stalkerData, setStalkerData] = useState<StalkerData | null>(null);
   const [showProfile, setShowProfile] = useState(false);
+  const [expiryDate, setExpiryDate] = useState<string | null>(null);
+  const [m3uUrlInput, setM3uUrlInput] = useState('');
   
   const [credentials, setCredentials] = useState<StalkerCredentials>({
-    serverUrl: '',
-    macId: ''
+    serverUrl: 'http://ztv01.info:8080',
+    macId: '00:1A:79:6E:2A:20'
   });
 
+  // Extract base URL from server URL
+  const getBaseUrl = (url: string): string => {
+    if (!url) return '';
+    let baseUrl = url.replace(/\/+$/, '');
+    if (!baseUrl.startsWith('http://') && !baseUrl.startsWith('https://')) {
+      baseUrl = `http://${baseUrl}`;
+    }
+    return baseUrl;
+  };
+
+  // Parse M3U URL to extract server URL and MAC ID
+  const parseM3uUrl = (url: string): { serverUrl: string; macId: string } | null => {
+    try {
+      const urlObj = new URL(url);
+      const params = new URLSearchParams(urlObj.search);
+      
+      let macId = params.get('mac');
+      if (macId) {
+        const serverUrl = `${urlObj.protocol}//${urlObj.host}`;
+        return { serverUrl, macId };
+      }
+      
+      // Try to extract MAC from path
+      const pathParts = urlObj.pathname.split('/').filter(p => p);
+      for (const part of pathParts) {
+        if (part.includes(':') && part.length === 17) {
+          return { serverUrl: `${urlObj.protocol}//${urlObj.host}`, macId: part };
+        }
+      }
+      
+      return null;
+    } catch {
+      return null;
+    }
+  };
+
+  // Handle M3U URL input for auto-parse
+  const handleM3uUrlInput = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const url = e.target.value;
+    setM3uUrlInput(url);
+    
+    if (url) {
+      const parsed = parseM3uUrl(url);
+      if (parsed) {
+        setCredentials({
+          serverUrl: parsed.serverUrl,
+          macId: parsed.macId
+        });
+        setError('');
+      } else {
+        setError('Could not auto-parse. Please enter credentials manually.');
+      }
+    }
+  };
+
   useEffect(() => {
-    const savedStalker = localStorage.getItem('stalkerCredentials');
-    if (savedStalker) {
-      setCredentials(JSON.parse(savedStalker));
-    }
-    const savedStalkerData = localStorage.getItem('stalkerData');
-    if (savedStalkerData) {
-      const data = JSON.parse(savedStalkerData);
-      setStalkerData(data);
-      setChannels(data.channels || []);
-      setFilteredChannels(data.channels || []);
-      setIsLoggedIn(true);
-    }
+    const loadSavedData = async () => {
+      try {
+        const savedStalker = localStorage.getItem('stalkerCredentials');
+        if (savedStalker) {
+          setCredentials(JSON.parse(savedStalker));
+        }
+        
+        // Load from IndexedDB instead of localStorage
+        const savedData = await loadFromIndexedDB('stalkerData');
+        if (savedData) {
+          setStalkerData(savedData);
+          setChannels(savedData.channels || []);
+          setFilteredChannels(savedData.channels || []);
+          setIsLoggedIn(true);
+          
+          // Extract expiry from profile
+          if (savedData.profile?.expiry) {
+            setExpiryDate(savedData.profile.expiry);
+          }
+        }
+      } catch (error) {
+        console.error('Error loading saved data:', error);
+      }
+    };
+    
+    loadSavedData();
   }, []);
 
   useEffect(() => {
@@ -76,9 +208,11 @@ export default function MacStalkerPage() {
     setLoading(true);
     setError('');
     try {
+      const cleanServerUrl = getBaseUrl(credentials.serverUrl);
+      
       const response = await axios.post('/api/stalker', {
         action: 'fetch',
-        serverUrl: credentials.serverUrl,
+        serverUrl: cleanServerUrl,
         macId: credentials.macId,
         debug: true
       });
@@ -90,13 +224,36 @@ export default function MacStalkerPage() {
         setFilteredChannels(data.channels || []);
         setCurrentPage(1);
         setIsLoggedIn(true);
+        
+        // Save credentials to localStorage (small data)
         localStorage.setItem('stalkerCredentials', JSON.stringify(credentials));
-        localStorage.setItem('stalkerData', JSON.stringify(data));
+        
+        // Save large data to IndexedDB
+        try {
+          await saveToIndexedDB('stalkerData', data);
+        } catch (dbError) {
+          console.error('Error saving to IndexedDB:', dbError);
+          // Still continue even if save fails
+        }
+        
+        // Extract expiry from profile
+        if (data.profile?.expiry) {
+          setExpiryDate(data.profile.expiry);
+        }
       } else {
         setError(response.data.error || 'Failed to fetch channels');
       }
     } catch (err: any) {
-      setError(err.message || 'Failed to fetch channels');
+      console.error('Fetch error:', err);
+      if (err.code === 'ECONNABORTED') {
+        setError('Connection timeout - The server is taking too long to respond');
+      } else if (err.response) {
+        setError(`Server error: ${err.response.status} - ${err.response.statusText}`);
+      } else if (err.request) {
+        setError('Network error - Could not connect to the server. Please check your URL.');
+      } else {
+        setError(err.message || 'Failed to fetch channels');
+      }
       setIsLoggedIn(false);
     } finally {
       setLoading(false);
@@ -117,7 +274,7 @@ export default function MacStalkerPage() {
     setCredentials(prev => ({ ...prev, [name]: value }));
   };
 
-  const handleLogout = () => {
+  const handleLogout = async () => {
     setIsLoggedIn(false);
     setChannels([]);
     setFilteredChannels([]);
@@ -127,8 +284,16 @@ export default function MacStalkerPage() {
     setCurrentPage(1);
     setSearchTerm('');
     setShowProfile(false);
+    setExpiryDate(null);
+    setM3uUrlInput('');
     localStorage.removeItem('stalkerCredentials');
-    localStorage.removeItem('stalkerData');
+    
+    // Remove from IndexedDB
+    try {
+      await saveToIndexedDB('stalkerData', null);
+    } catch (error) {
+      console.error('Error clearing IndexedDB:', error);
+    }
   };
 
   const showChannelDetails = (channel: StalkerChannel) => {
@@ -148,7 +313,7 @@ export default function MacStalkerPage() {
 
   const generateStalkerM3u8Url = (id: string | number): string => {
     const streamId = typeof id === 'number' ? String(id) : id;
-    const baseUrl = credentials.serverUrl.replace(/\/+$/, '');
+    const baseUrl = getBaseUrl(credentials.serverUrl);
     const mac = credentials.macId;
     return `${baseUrl}/play/live.php?mac=${mac}&stream=${streamId}&extension=m3u8`;
   };
@@ -167,6 +332,38 @@ export default function MacStalkerPage() {
     }
   };
 
+  const isExpired = (): boolean => {
+    if (!expiryDate) return false;
+    const expiry = new Date(expiryDate);
+    const now = new Date();
+    return expiry < now;
+  };
+
+  const getDaysUntilExpiry = (): number | null => {
+    if (!expiryDate) return null;
+    const expiry = new Date(expiryDate);
+    const now = new Date();
+    const diffTime = expiry.getTime() - now.getTime();
+    const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
+    return diffDays;
+  };
+
+  const formatExpiryDate = (): string => {
+    if (!expiryDate) return 'Not available';
+    try {
+      const date = new Date(expiryDate);
+      return date.toLocaleDateString('en-US', {
+        year: 'numeric',
+        month: 'long',
+        day: 'numeric',
+        hour: '2-digit',
+        minute: '2-digit'
+      });
+    } catch {
+      return expiryDate;
+    }
+  };
+
   return (
     <Layout>
       {!isLoggedIn ? (
@@ -177,6 +374,30 @@ export default function MacStalkerPage() {
             <p className="text-gray-400 text-sm mt-2">Enter your MAC address to access channels</p>
           </div>
           <form onSubmit={handleLogin} className="space-y-4">
+            {/* M3U URL Input with Auto-Parse */}
+            <div>
+              <label className="block text-sm font-medium mb-2 text-gray-300">
+                Or paste M3U URL (auto-parse)
+              </label>
+              <input
+                type="text"
+                value={m3uUrlInput}
+                onChange={handleM3uUrlInput}
+                className="w-full px-4 py-3 bg-gray-700 border border-gray-600 rounded-xl focus:outline-none focus:ring-2 focus:ring-purple-500 text-white transition-all"
+                placeholder="http://ztv01.info:8080/get.php?username=XXX&password=XXX&type=m3u_plus"
+              />
+              <div className="flex items-center gap-2 mt-1">
+                <p className="text-xs text-gray-400">Auto-extracts: Host, MAC ID</p>
+                {m3uUrlInput && (
+                  <span className="text-xs text-green-400">✓ Parsed</span>
+                )}
+              </div>
+            </div>
+
+            <div className="border-t border-gray-700 pt-4">
+              <p className="text-xs text-gray-400 text-center mb-4">Or enter manually</p>
+            </div>
+
             <div>
               <label className="block text-sm font-medium mb-2 text-gray-300">Server URL</label>
               <input
@@ -185,9 +406,14 @@ export default function MacStalkerPage() {
                 value={credentials.serverUrl}
                 onChange={handleInputChange}
                 className="w-full px-4 py-3 bg-gray-700 border border-gray-600 rounded-xl focus:outline-none focus:ring-2 focus:ring-purple-500 text-white transition-all"
-                placeholder=""
+                placeholder="http://ztv01.info:8080"
                 required
               />
+              {credentials.serverUrl && (
+                <div className="mt-1 text-xs text-gray-400">
+                  🌎 Host: {credentials.serverUrl}
+                </div>
+              )}
             </div>
             <div>
               <label className="block text-sm font-medium mb-2 text-gray-300">MAC ID</label>
@@ -197,9 +423,14 @@ export default function MacStalkerPage() {
                 value={credentials.macId}
                 onChange={handleInputChange}
                 className="w-full px-4 py-3 bg-gray-700 border border-gray-600 rounded-xl focus:outline-none focus:ring-2 focus:ring-purple-500 text-white transition-all font-mono"
-                placeholder=""
+                placeholder="00:1A:79:6E:2A:20"
                 required
               />
+              {credentials.macId && (
+                <div className="mt-1 text-xs text-gray-400">
+                  📱 MAC: {credentials.macId}
+                </div>
+              )}
             </div>
             {error && (
               <div className="bg-red-900/50 border border-red-700 text-red-200 px-4 py-3 rounded-xl">
@@ -233,6 +464,13 @@ export default function MacStalkerPage() {
               className="px-5 py-2.5 bg-gradient-to-r from-purple-600 to-purple-700 hover:from-purple-700 hover:to-purple-800 rounded-xl transition-all duration-200 text-sm flex items-center gap-2 shadow-lg hover:shadow-xl"
             >
               <span>👤</span> Profile Info
+              {expiryDate && (
+                <span className={`ml-2 px-2 py-0.5 rounded-full text-xs ${
+                  isExpired() ? 'bg-red-600' : 'bg-green-600'
+                }`}>
+                  {isExpired() ? 'Expired' : `${getDaysUntilExpiry()}d`}
+                </span>
+              )}
             </button>
           </div>
 
@@ -254,44 +492,83 @@ export default function MacStalkerPage() {
                   </div>
                   <div className="space-y-3">
                     <div className="bg-gray-700/50 rounded-xl p-4">
-                      <div className="text-xs text-gray-400 uppercase tracking-wider mb-1">Server URL</div>
+                      <div className="text-xs text-gray-400 uppercase tracking-wider mb-1">🌎 Host</div>
                       <div className="text-white text-sm break-all font-mono">{credentials.serverUrl}</div>
                     </div>
                     <div className="bg-gray-700/50 rounded-xl p-4">
-                      <div className="text-xs text-gray-400 uppercase tracking-wider mb-1">MAC ID</div>
+                      <div className="text-xs text-gray-400 uppercase tracking-wider mb-1">📱 MAC ID</div>
                       <div className="text-white text-sm font-mono">{credentials.macId}</div>
                     </div>
                     {stalkerData?.profile && (
                       <>
                         {stalkerData.profile.name && (
                           <div className="bg-gray-700/50 rounded-xl p-4">
-                            <div className="text-xs text-gray-400 uppercase tracking-wider mb-1">Name</div>
+                            <div className="text-xs text-gray-400 uppercase tracking-wider mb-1">👤 Name</div>
                             <div className="text-white text-sm">{stalkerData.profile.name}</div>
-                          </div>
-                        )}
-                        {stalkerData.profile.expiry && (
-                          <div className="bg-gray-700/50 rounded-xl p-4">
-                            <div className="text-xs text-gray-400 uppercase tracking-wider mb-1">Expiry Date</div>
-                            <div className="text-white text-sm font-mono">{stalkerData.profile.expiry}</div>
                           </div>
                         )}
                         {stalkerData.profile.username && (
                           <div className="bg-gray-700/50 rounded-xl p-4">
-                            <div className="text-xs text-gray-400 uppercase tracking-wider mb-1">Username</div>
+                            <div className="text-xs text-gray-400 uppercase tracking-wider mb-1">👤 Username</div>
                             <div className="text-white text-sm font-mono">{stalkerData.profile.username}</div>
                           </div>
                         )}
                       </>
                     )}
                     <div className="bg-gray-700/50 rounded-xl p-4">
-                      <div className="text-xs text-gray-400 uppercase tracking-wider mb-1">Total Channels</div>
+                      <div className="text-xs text-gray-400 uppercase tracking-wider mb-1">📺 Total Channels</div>
                       <div className="text-white text-sm font-bold">{channels.length.toLocaleString()}</div>
                     </div>
-                    <div className="bg-green-900/30 border border-green-700 rounded-xl p-4">
+                    
+                    <div className={`rounded-xl p-4 border ${
+                      isExpired() 
+                        ? 'bg-red-900/30 border-red-700' 
+                        : expiryDate 
+                          ? 'bg-green-900/30 border-green-700' 
+                          : 'bg-gray-700/50 border-gray-600'
+                    }`}>
+                      <div className="text-xs text-gray-400 uppercase tracking-wider mb-1">📅 Account Status</div>
+                      <div className="flex items-center justify-between">
+                        <span className="text-sm font-semibold">
+                          {expiryDate ? (
+                            isExpired() ? (
+                              <span className="text-red-400">⚠️ EXPIRED</span>
+                            ) : (
+                              <span className="text-green-400">✅ Active</span>
+                            )
+                          ) : (
+                            <span className="text-gray-400">Unknown</span>
+                          )}
+                        </span>
+                        {expiryDate && !isExpired() && (
+                          <span className="text-sm text-green-400">
+                            {getDaysUntilExpiry()} days remaining
+                          </span>
+                        )}
+                      </div>
+                      {expiryDate && (
+                        <div className="mt-2 text-sm">
+                          <span className="text-gray-400">Expires: </span>
+                          <span className={`font-mono ${isExpired() ? 'text-red-400' : 'text-white'}`}>
+                            {formatExpiryDate()}
+                          </span>
+                        </div>
+                      )}
+                    </div>
+
+                    <div className={`rounded-xl p-4 border ${
+                      isExpired() 
+                        ? 'bg-red-900/30 border-red-700' 
+                        : 'bg-green-900/30 border-green-700'
+                    }`}>
                       <div className="text-xs text-gray-400 uppercase tracking-wider mb-1">Status</div>
-                      <div className="text-green-400 text-sm font-semibold flex items-center gap-2">
-                        <span className="inline-block w-2 h-2 bg-green-400 rounded-full animate-pulse"></span>
-                        Connected
+                      <div className={`text-sm font-semibold flex items-center gap-2 ${
+                        isExpired() ? 'text-red-400' : 'text-green-400'
+                      }`}>
+                        <span className={`inline-block w-2 h-2 rounded-full ${
+                          isExpired() ? 'bg-red-400' : 'bg-green-400'
+                        } animate-pulse`}></span>
+                        {isExpired() ? 'Expired - Please renew your subscription' : 'Connected'}
                       </div>
                     </div>
                   </div>
